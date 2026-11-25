@@ -589,6 +589,99 @@ START_TEST(drachtio_3_0_6)
 }
 END_TEST
 
+START_TEST(drachtio_3_0_9)
+{
+  struct event *e;
+  struct message *m;
+  nta_incoming_t *irq;
+  nta_reliable_t *rel;
+  msg_t *response;
+  sip_t const *sip;
+  char rack[64];
+  char const progress_sdp[] = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n"
+    "s=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0\r\n";
+  char const answer_sdp[] = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\n"
+    "s=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 20000 RTP/AVP 0\r\n";
+
+  S2_CASE("drachtio-3.0.9", "200 OK queued behind an un-PRACKed 183",
+	  "RFC 3262 section 3: the app answers 200 while a reliable 183 "
+	  "with SDP is still outstanding. nta queues the 200 and "
+	  "nta_incoming_treply() still reports success, but "
+	  "nta_incoming_getresponse() must return the queued 200 -- with "
+	  "its own Contact and SDP -- not the un-PRACKed 183, and the 200 "
+	  "must not reach the wire until the PRACK arrives");
+
+  prack_count = 0;
+
+  fail_if(s2_sip_request_to(peer, SIP_METHOD_INVITE, NULL,
+			    SIPTAG_SUPPORTED_STR("100rel"),
+			    TAG_END()));
+  e = wait_for_stateless(sip_method_invite);
+  irq = late_irq(e);
+  s2_nta_free_event(e);
+
+  rel = nta_reliable_treply(irq, prack_callback, NULL,
+			    SIP_183_SESSION_PROGRESS,
+			    SIPTAG_CONTACT(s2sip->sut.contact),
+			    SIPTAG_CONTENT_TYPE_STR("application/sdp"),
+			    SIPTAG_PAYLOAD_STR(progress_sdp),
+			    TAG_END());
+  fail_unless(rel != NULL);
+
+  m = s2_sip_wait_for_response(183, SIP_METHOD_INVITE);
+  fail_unless(m->sip->sip_rseq != NULL);
+  snprintf(rack, sizeof rack, "%lu %lu INVITE",
+	   (unsigned long)m->sip->sip_rseq->rs_response,
+	   (unsigned long)m->sip->sip_cseq->cs_seq);
+  s2_sip_update_dialog(peer, m);
+  s2_sip_free_message(m);
+
+  /* The app answers 200 before the 183 is PRACKed. nta must queue it:
+     nta_incoming_treply() still reports success ... */
+  fail_if(nta_incoming_treply(irq, SIP_200_OK,
+			      SIPTAG_CONTACT(s2sip->sut.contact),
+			      SIPTAG_CONTENT_TYPE_STR("application/sdp"),
+			      SIPTAG_PAYLOAD_STR(answer_sdp),
+			      TAG_END()));
+
+  /* ... but the 200 has not actually gone out yet */
+  quiet();
+
+  /* nta_incoming_getresponse() -- what drachtio-server reports to the
+     client as "message sent" -- must be the queued 200, not the 183 */
+  response = nta_incoming_getresponse(irq);
+  fail_unless(response != NULL);
+  sip = sip_object(response);
+  fail_unless(sip->sip_status != NULL);
+  fail_unless(sip->sip_status->st_status == 200);
+  fail_unless(sip->sip_contact != NULL);
+  fail_unless(sip->sip_payload != NULL);
+  fail_unless(sip->sip_payload->pl_len == strlen(answer_sdp));
+  fail_unless(memcmp(sip->sip_payload->pl_data, answer_sdp,
+		     sip->sip_payload->pl_len) == 0);
+  msg_destroy(response);
+
+  /* Now the PRACK arrives for the 183 ... */
+  fail_if(s2_sip_request_to(peer, SIP_METHOD_PRACK, NULL,
+			    SIPTAG_RACK_STR(rack),
+			    TAG_END()));
+  m = s2_sip_wait_for_response(200, SIP_METHOD_PRACK);
+  s2_sip_free_message(m);
+  fail_unless(prack_count == 1);
+
+  /* ... which releases the queued 200, with the real answer SDP */
+  m = s2_sip_wait_for_response(200, SIP_METHOD_INVITE);
+  fail_unless(m->sip->sip_payload != NULL);
+  fail_unless(m->sip->sip_payload->pl_len == strlen(answer_sdp));
+  fail_unless(memcmp(m->sip->sip_payload->pl_data, answer_sdp,
+		     m->sip->sip_payload->pl_len) == 0);
+  s2_sip_free_message(m);
+
+  nta_incoming_destroy(irq);
+  quiet();
+}
+END_TEST
+
 START_TEST(drachtio_3_0_7)
 {
   struct event *e;
@@ -673,6 +766,7 @@ TCase *check_nta_drachtio_3_0(void)
   tcase_add_test(tc, drachtio_3_0_6);
   tcase_add_test(tc, drachtio_3_0_7);
   tcase_add_test(tc, drachtio_3_0_8);
+  tcase_add_test(tc, drachtio_3_0_9);
 
   return tc;
 }
