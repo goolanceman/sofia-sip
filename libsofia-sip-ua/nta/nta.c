@@ -6160,6 +6160,18 @@ msg_t *nta_incoming_getrequest_ackcancel(nta_incoming_t *irq)
  * that the message is not copied, but a new reference to it is created. Use
  * msg_dup() or msg_copy() to make a copy of it.
  *
+ * If a final (>= 2xx) response was given to nta_incoming_treply() while an
+ * unacknowledged reliable (100rel) provisional response with a session
+ * description was still outstanding, RFC 3262 section 3 requires that the
+ * final response be held and sent only after the provisional response is
+ * PRACKed (see reliable_final()). In that case irq_response still refers to
+ * the last response that actually went out on the wire -- an older
+ * provisional -- even though the application's final response was accepted
+ * and queued. Callers that use nta_incoming_getresponse() right after
+ * nta_incoming_treply() to report what was "sent" need the queued final
+ * response instead, since that is the message that will actually be
+ * transmitted once the PRACK arrives.
+ *
  * @param irq incoming transaction handle
  *
  * @retval
@@ -6169,7 +6181,22 @@ msg_t *nta_incoming_getresponse(nta_incoming_t *irq)
 {
   msg_t *msg = NULL;
 
-  if (irq && irq->irq_response)
+  if (irq == NULL)
+    return NULL;
+
+  if (irq->irq_reliable) {
+    nta_reliable_t *r;
+
+    for (r = irq->irq_reliable; r; r = r->rel_next) {
+      if (r->rel_unsent && r->rel_rseq == 0 &&
+	  sip_object(r->rel_unsent)->sip_status->st_status >= 200) {
+	msg = msg_ref_create(r->rel_unsent);
+	break;
+      }
+    }
+  }
+
+  if (msg == NULL && irq->irq_response)
     msg = msg_ref_create(irq->irq_response);
 
   return msg;
